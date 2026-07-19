@@ -943,6 +943,83 @@ function buildVideoUrl(config, options = {}) {
   return base + ep;
 }
 
+/**
+ * Agnes / new-api 渠道根地址（与 new-api agnes.apiOrigin 一致）：
+ * 配置里常带 .../v1 或 .../v1/videos，需剥掉后再拼 /v1/videos/{task_id}。
+ */
+function getAgnesApiRoot(baseUrl) {
+  let base = String(baseUrl || 'https://apihub.agnes-ai.com').replace(/\/$/, '');
+  for (const suf of ['/v1/videos', '/v1']) {
+    if (base.length >= suf.length && base.slice(-suf.length).toLowerCase() === suf) {
+      base = base.slice(0, -suf.length).replace(/\/$/, '');
+    }
+  }
+  return base || 'https://apihub.agnes-ai.com';
+}
+
+/** 内置/历史默认查询路径：由代码统一按 new-api 拼装，忽略配置里的旧值 */
+function isAgnesBuiltinQueryEndpoint(ep) {
+  const s = String(ep || '').trim();
+  if (!s) return true;
+  return (
+    /^\/?(v1\/)?videos\/\{(taskId|task_id|id|videoId|video_id)\}\/?$/i.test(s) ||
+    /^\/?agnesapi(\?|$)/i.test(s)
+  );
+}
+
+/**
+ * Agnes 结果查询（对齐 new-api TaskAdaptor.FetchTask）：
+ * GET {origin}/v1/videos/{task_id}
+ */
+function buildAgnesPollUrl(config, pollId) {
+  const root = getAgnesApiRoot(config.base_url);
+  const id = String(pollId || '').trim();
+  const cfgEp = String(config.query_endpoint || '').trim();
+
+  if (cfgEp && !isAgnesBuiltinQueryEndpoint(cfgEp)) {
+    const base = (config.base_url || '').replace(/\/$/, '');
+    let ep = cfgEp;
+    ep = String(ep)
+      .replace(/\{videoId\}/gi, encodeURIComponent(id))
+      .replace(/\{video_id\}/gi, encodeURIComponent(id))
+      .replace(/\{taskId\}/gi, encodeURIComponent(id))
+      .replace(/\{task_id\}/gi, encodeURIComponent(id))
+      .replace(/\{id\}/gi, encodeURIComponent(id));
+    if (!ep.startsWith('/')) ep = '/' + ep;
+    return base + ep;
+  }
+
+  return `${root}/v1/videos/${encodeURIComponent(id)}`;
+}
+
+/**
+ * 对齐 new-api：extractVideoURL + taskcommon.ExtractVideoURLFromJSON，
+ * 并兼容当前 Agnes 完成态把直链放在 metadata.url（实测 2026-07）。
+ */
+function extractAgnesVideoUrl(data) {
+  if (!data || typeof data !== 'object') return null;
+  const nested = (obj, key) =>
+    obj && typeof obj === 'object' && !Array.isArray(obj) ? obj[key] : null;
+  const candidates = [
+    data.video_url,
+    nested(data.content, 'video_url'),
+    nested(data.data, 'video_url'),
+    nested(data.data, 'url'),
+    // 当前官方完成态：metadata.url 才是 MP4 直链
+    nested(data.metadata, 'url'),
+    nested(data.metadata, 'video_url'),
+    nested(data.metadata, 'result_url'),
+    data.remixed_from_video_id,
+    nested(data.data, 'remixed_from_video_id'),
+    data.url,
+  ];
+  for (const c of candidates) {
+    const u = coerceHttpVideoUrl(c);
+    if (u) return u;
+  }
+  return pickProxyVideoUrl(data);
+}
+
 function buildQueryUrl(config, taskId) {
   const p = (config.provider || '').toLowerCase();
   const proto = resolveVideoProtocol(config);
@@ -950,6 +1027,7 @@ function buildQueryUrl(config, taskId) {
   const isVolc = p === 'volces' || p === 'volcengine' || p === 'volc';
   const isSora = proto === 'sora';
   if (isVolc) return getVolcVideoBase(config) + VOLC_VIDEO_QUERY_PATH + '/' + encodeURIComponent(taskId);
+  if (proto === 'agnes') return buildAgnesPollUrl(config, taskId);
   const base = (config.base_url || '').replace(/\/$/, '');
   let defaultEp;
   if (isSora) defaultEp = '/v1/videos/{taskId}';
@@ -957,7 +1035,6 @@ function buildQueryUrl(config, taskId) {
   else if (proto === 'veo3') defaultEp = '/v1/video/query?id={taskId}';
   else if (isDashScope) defaultEp = '/api/v1/tasks/{taskId}';
   else if (proto === 'volcengine_omni') defaultEp = '/v1/videos/generations/async/{taskId}';
-  else if (proto === 'agnes') defaultEp = '/videos/{taskId}';
   else defaultEp = '/video/task/{taskId}';
   let ep = config.query_endpoint || defaultEp;
   ep = String(ep).replace(/\{taskId\}/gi, encodeURIComponent(taskId)).replace(/\{task_id\}/gi, encodeURIComponent(taskId)).replace(/\{id\}/gi, encodeURIComponent(taskId));
@@ -2527,7 +2604,7 @@ async function callAgnesVideoApi(db, config, log, opts) {
     return { error: 'Agnes 响应解析失败: ' + e.message + ' | raw: ' + raw.slice(0, 200) };
   }
 
-  const directUrl = pickProxyVideoUrl(data);
+  const directUrl = extractAgnesVideoUrl(data);
   if (directUrl) {
     log.info('[Agnes] 直接返回 video_url', { video_url: directUrl, video_gen_id });
     return { video_url: directUrl };
@@ -3774,8 +3851,12 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
     log.warn('[poll] Jimeng AI API 不应进入轮询', { video_gen_id: videoGenId, task_id: taskId });
     return { error: 'Jimeng AI API 为同步返回视频地址，不应进入轮询' };
   }
-  const queryUrl = () => buildQueryUrl(config, taskId);
-  log.info('[poll] ????', { video_gen_id: videoGenId, task_id: taskId, protocol, poll_url: queryUrl() });
+  let pollTaskId = taskId;
+  /** Agnes：completed 后 remixed_from_video_id / metadata.url 偶发迟到，对齐 new-api 继续多查几轮 */
+  let agnesCompletedWithoutUrl = 0;
+  const AGNES_COMPLETED_URL_GRACE = 12;
+  const queryUrl = () => buildQueryUrl(config, pollTaskId);
+  log.info('[poll] 开始', { video_gen_id: videoGenId, task_id: pollTaskId, protocol, poll_url: queryUrl() });
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     await new Promise((r) => setTimeout(r, intervalMs));
     try {
@@ -3958,20 +4039,39 @@ async function pollVideoTask(db, log, videoGenId, taskId, config, maxAttempts = 
 
       if (isAgnes) {
         const status = extractPollTaskStatus(data);
-        log.info('[Agnes poll] 状态', { video_gen_id: videoGenId, attempt, status, progress: data.progress, id: data.id });
+        log.info('[Agnes poll] 状态', {
+          video_gen_id: videoGenId,
+          attempt,
+          status,
+          progress: data.progress,
+          id: data.id,
+          poll_id: pollTaskId,
+          poll_url: queryUrl(),
+        });
         if (isPollTaskFailed(status)) {
           const msg = extractPollFailureMessage(data) || 'Agnes 视频任务失败';
           log.warn('[Agnes poll] 任务失败', { video_gen_id: videoGenId, msg, data: JSON.stringify(data).slice(0, 300) });
           return { error: String(msg).slice(0, 500) };
         }
-        const videoUrl = pickProxyVideoUrl(data);
+        // 对齐 new-api ParseTaskResult / ExtractVideoURLFromJSON（含 metadata.url、remixed_from_video_id）
+        const videoUrl = extractAgnesVideoUrl(data);
         if (videoUrl && isPlausibleHttpVideoUrl(videoUrl)) {
           log.info('[Agnes poll] 完成', { video_gen_id: videoGenId, video_url: videoUrl });
           return { video_url: videoUrl };
         }
         if (status === 'succeeded' || status === 'completed' || status === 'done') {
-          log.warn('[Agnes poll] 标记完成但未返回 video_url', { video_gen_id: videoGenId, data: JSON.stringify(data).slice(0, 500) });
-          return { error: 'Agnes 任务完成但未返回视频地址: ' + JSON.stringify(data).slice(0, 300) };
+          agnesCompletedWithoutUrl += 1;
+          log.warn('[Agnes poll] completed 但尚未返回视频直链，继续等待', {
+            video_gen_id: videoGenId,
+            miss: agnesCompletedWithoutUrl,
+            grace: AGNES_COMPLETED_URL_GRACE,
+            data: JSON.stringify(data).slice(0, 500),
+          });
+          if (agnesCompletedWithoutUrl >= AGNES_COMPLETED_URL_GRACE) {
+            return {
+              error: 'Agnes 任务完成但未返回视频地址: ' + JSON.stringify(data).slice(0, 300),
+            };
+          }
         }
         continue;
       }
@@ -4075,6 +4175,9 @@ module.exports = {
   normalizeAspectRatioForApi,
   isPlausibleHttpVideoUrl,
   pickProxyVideoUrl,
+  extractAgnesVideoUrl,
+  buildAgnesPollUrl,
+  getAgnesApiRoot,
   buildAgnesVideoImagePayload,
   formatVideoPostBodyForLog,
   isSeedance2FamilyModel,
